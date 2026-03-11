@@ -5,10 +5,12 @@ import random
 import string
 import sys, os
 from pymongo import MongoClient
+from apscheduler.schedulers.background import BackgroundScheduler
 
 client = MongoClient("mongodb://localhost:27017/")
 db = client["neobank"]
 users_col = db["users"]
+requests_col = db["income_requests"]
 
 if sys.platform == "win32":
     import ctypes
@@ -51,7 +53,6 @@ class Bank:
     def __init__(self):
         self.accounts: dict[str, dict] = {}
         self.current: str | None = None
-        # Seed a demo account
         self._create("demo", "123", "Alex Johnson")
         self.accounts["demo"]["balance"] = 4_250.00
         self.accounts["demo"]["transactions"] = [
@@ -73,9 +74,10 @@ class Bank:
                     "account_no": user.get("account_no", self._gen_acc_no()),
                     "balance": user.get("balance", 0.0),
                     "transactions": user.get("transactions", []),
+                    "income": user.get("income", 0.0),
+                    "last_income_date": user.get("last_income_date", None),
                 }
 
-    # ── account helpers ──
     def _gen_acc_no(self):
         return "".join(random.choices(string.digits, k=12))
 
@@ -86,6 +88,8 @@ class Bank:
             "account_no": self._gen_acc_no(),
             "balance": 0.0,
             "transactions": [],
+            "income": 0.0,
+            "last_income_date": None,
         }
         users_col.update_one(
             {"username": username},
@@ -96,6 +100,8 @@ class Bank:
                 "account_no": self.accounts[username]["account_no"],
                 "balance": 0.0,
                 "transactions": [],
+                "income": 0.0,
+                "last_income_date": None,
             }},
             upsert=True
         )
@@ -120,18 +126,9 @@ class Bank:
     def logout(self):
         self.current = None
 
-    # ── operations ──
     @property
     def acc(self):
         return self.accounts[self.current]
-
-    def deposit(self, amount):
-        if amount <= 0:
-            return False, "Amount must be positive."
-        self.acc["balance"] += amount
-        self._log("Deposit", amount, "credit")
-        self._sync(self.current)
-        return True, f"Deposited ${amount:,.2f}"
 
     def withdraw(self, amount):
         if amount <= 0:
@@ -143,7 +140,7 @@ class Bank:
         self._sync(self.current)
         return True, f"Withdrew ${amount:,.2f}"
 
-    def transfer(self, to_user, amount):
+    def transfer(self, to_user, amount, description):
         if to_user not in self.accounts:
             return False, "Recipient account not found."
         if to_user == self.current:
@@ -152,13 +149,21 @@ class Bank:
             return False, "Amount must be positive."
         if amount > self.acc["balance"]:
             return False, "Insufficient funds."
+        if not description.strip():
+            return False, "Transfer description is required."
         self.acc["balance"] -= amount
-        self._log(f"Transfer to {to_user}", -amount, "debit")
+        self.acc["transactions"].append({
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "desc": f"Transfer to {to_user}: {description}",
+            "amount": -amount,
+            "type": "debit",
+        })
         self.accounts[to_user]["balance"] += amount
         self.accounts[to_user]["transactions"].append({
             "date": datetime.now().strftime("%Y-%m-%d"),
-            "desc": f"Transfer from {self.current}",
-            "amount": amount, "type": "credit",
+            "desc": f"Transfer from {self.current}: {description}",
+            "amount": amount,
+            "type": "credit",
         })
         self._sync(self.current)
         self._sync(to_user)
@@ -177,6 +182,8 @@ class Bank:
             {"$set": {
                 "balance": acc["balance"],
                 "transactions": acc["transactions"],
+                "income": acc.get("income", 0.0),
+                "last_income_date": acc.get("last_income_date", None),
             }}
         )
 
@@ -219,13 +226,16 @@ class BankingApp(tk.Tk):
         self.minsize(860, 580)
         self.resizable(True, True)
 
-        # sidebar (always visible after login)
         self.sidebar = None
         self.content = None
 
+        self.scheduler = BackgroundScheduler()
+        self.scheduler.add_job(self._check_monthly_income, "interval", minutes=1)
+        self.scheduler.start()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
         self._show_login()
 
-    # ── page switcher ──
     def _clear(self):
         for w in self.winfo_children():
             w.destroy()
@@ -235,11 +245,11 @@ class BankingApp(tk.Tk):
     def _show_login(self):
         self._clear()
         LoginPage(self)
-        
+
     def _show_admin(self):
         self._clear()
         AdminPage(self)
-        
+
     def _show_options(self):
         self._build_shell()
         OptionsPage(self.content, self.bank, self)
@@ -253,10 +263,6 @@ class BankingApp(tk.Tk):
         self._build_shell()
         DashboardPage(self.content, self.bank, self)
 
-    def _show_deposit(self):
-        self._build_shell()
-        DepositPage(self.content, self.bank, self)
-
     def _show_withdraw(self):
         self._build_shell()
         WithdrawPage(self.content, self.bank, self)
@@ -269,39 +275,65 @@ class BankingApp(tk.Tk):
         self._build_shell()
         HistoryPage(self.content, self.bank, self)
 
-    # ── shell (sidebar + content area) ──
+    def _show_income(self):
+        self._build_shell()
+        IncomePage(self.content, self.bank, self)
+
+    def _check_monthly_income(self):
+        now = datetime.now()
+        for username, acc in self.bank.accounts.items():
+            income = acc.get("income", 0.0)
+            if income <= 0:
+                continue
+            last = acc.get("last_income_date")
+            last_dt = datetime.strptime(last, "%Y-%m-%d") if last else None
+            should_pay = (
+                last_dt is None or
+                (now.year > last_dt.year) or
+                (now.year == last_dt.year and now.month > last_dt.month)
+            )
+            if should_pay:
+                acc["balance"] += income
+                acc["last_income_date"] = now.strftime("%Y-%m-%d")
+                acc["transactions"].append({
+                    "date": now.strftime("%Y-%m-%d"),
+                    "desc": "Monthly Income",
+                    "amount": income,
+                    "type": "credit",
+                })
+                self.bank._sync(username)
+
+    def _on_close(self):
+        self.scheduler.shutdown()
+        self.destroy()
+
     def _build_shell(self):
         if self.sidebar:
-            # clear content only
             for w in self.content.winfo_children():
                 w.destroy()
             return
-        # sidebar
         self.sidebar = make_frame(self, bg="#0A0C12", width=210)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
-        # logo
         logo_f = make_frame(self.sidebar, bg="#0A0C12")
         logo_f.pack(fill="x", padx=20, pady=(28, 10))
         tk.Label(logo_f, text="◈", font=("Segoe UI", 22), fg=ACCENT, bg="#0A0C12").pack(side="left")
         tk.Label(logo_f, text=" NeoBank", font=("Segoe UI", 16, "bold"), fg=TEXT, bg="#0A0C12").pack(side="left")
-        
 
         sep(self.sidebar, bg=BORDER).pack(fill="x", padx=16, pady=8)
 
         nav_items = [
             ("⌂  Dashboard",  self._show_dashboard),
-            ("↓  Deposit",     self._show_deposit),
             ("↑  Withdraw",    self._show_withdraw),
             ("⇄  Transfer",    self._show_transfer),
             ("≡  History",     self._show_history),
-            ("⚙  Options", self._show_options),
+            ("$  Income",      self._show_income),
+            ("⚙  Options",     self._show_options),
         ]
         for text, cmd in nav_items:
             self._nav_btn(text, cmd)
 
-        # bottom: user info + logout
         bottom = make_frame(self.sidebar, bg="#0A0C12")
         bottom.pack(side="bottom", fill="x", padx=16, pady=16)
         sep(self.sidebar, bg=BORDER).pack(side="bottom", fill="x", padx=16, pady=(0, 4))
@@ -313,7 +345,6 @@ class BankingApp(tk.Tk):
         btn(bottom, "  ⏻  Logout", self._logout,
             color="#1C2333", fg=RED, width=16).pack(fill="x", pady=(8, 0))
 
-        # content
         self.content = make_frame(self, bg=BG)
         self.content.pack(side="left", fill="both", expand=True)
 
@@ -344,7 +375,6 @@ class LoginPage(tk.Frame):
         outer = make_frame(self, bg=BG)
         outer.place(relx=0.5, rely=0.5, anchor="center")
 
-        # card
         card = make_frame(outer, bg=CARD)
         card.pack(padx=4, pady=4)
         inner = make_frame(card, bg=CARD)
@@ -367,7 +397,7 @@ class LoginPage(tk.Frame):
                  font=FONT_SM, fg=ACCENT, bg=CARD, cursor="hand2").pack(pady=(12, 0))
         inner.winfo_children()[-1].bind("<Button-1>", lambda e: self.app._show_register())
 
-        label(inner, "( Demo: Username = Basil  Password = 123456 )",
+        label(inner, "( Demo: Username = demo  Password = 123 )",
               font=("Segoe UI", 8), fg=SUBTEXT, bg=CARD).pack(pady=(10, 0))
 
         self.usr.focus()
@@ -450,7 +480,6 @@ class DashboardPage(tk.Frame):
         label(self, "Here's your financial overview",
               font=FONT_SM, fg=SUBTEXT, bg=BG).pack(anchor="w", pady=(2, 20))
 
-        # balance card
         bal_card = make_frame(self, bg=ACCENT)
         bal_card.pack(fill="x", pady=(0, 18))
         inner = make_frame(bal_card, bg=ACCENT)
@@ -461,15 +490,14 @@ class DashboardPage(tk.Frame):
         label(inner, f"Account  ···· {acc['account_no'][-4:]}",
               font=FONT_SM, fg="#BDD4FF", bg=ACCENT).pack(anchor="w")
 
-        # quick actions
         label(self, "Quick Actions", font=FONT_MED, bg=BG).pack(anchor="w", pady=(0, 10))
         row = make_frame(self, bg=BG)
         row.pack(fill="x", pady=(0, 20))
         for text, cmd, color in [
-            ("↓  Deposit",   app._show_deposit,  GREEN),
             ("↑  Withdraw",  app._show_withdraw, RED),
             ("⇄  Transfer",  app._show_transfer, ACCENT2),
             ("≡  History",   app._show_history,  ACCENT),
+            ("$  Income",    app._show_income,   GREEN),
         ]:
             b = tk.Button(row, text=text, command=cmd,
                           bg=CARD, fg=color, font=("Segoe UI", 10, "bold"),
@@ -478,7 +506,6 @@ class DashboardPage(tk.Frame):
                           cursor="hand2", bd=0)
             b.pack(side="left", expand=True, fill="x", padx=(0, 8))
 
-        # recent transactions
         label(self, "Recent Transactions", font=FONT_MED, bg=BG).pack(anchor="w", pady=(0, 10))
         txs = list(reversed(acc["transactions"]))[:5]
         if not txs:
@@ -500,8 +527,7 @@ class DashboardPage(tk.Frame):
 
 
 class _OpPage(tk.Frame):
-    """Base for deposit / withdraw / transfer."""
-    TITLE  = ""
+    TITLE    = ""
     SUBTITLE = ""
     BTN_COLOR = ACCENT
 
@@ -530,21 +556,6 @@ class _OpPage(tk.Frame):
             messagebox.showerror("Error", msg)
 
 
-class DepositPage(_OpPage):
-    TITLE    = "Deposit Funds"
-    SUBTITLE = "Add money to your account"
-    BTN_COLOR = GREEN
-
-    def _fields(self):
-        self.amt = self._field("Amount ($)")
-        btn(self, "Deposit", self._go, color=GREEN, fg="#0D0F14", width=20).pack(anchor="w", ipady=4)
-
-    def _go(self):
-        try: amt = float(self.amt.get())
-        except ValueError: messagebox.showerror("Error", "Enter a valid number."); return
-        self._result(*self.bank.deposit(amt))
-
-
 class WithdrawPage(_OpPage):
     TITLE    = "Withdraw Funds"
     SUBTITLE = "Take cash from your account"
@@ -564,14 +575,99 @@ class TransferPage(_OpPage):
     SUBTITLE = "Send funds to another NeoBank account"
 
     def _fields(self):
-        self.to  = self._field("Recipient Username")
-        self.amt = self._field("Amount ($)")
+        self.to   = self._field("Recipient Username")
+        self.amt  = self._field("Amount ($)")
+        self.desc = self._field("Description (required)")
         btn(self, "Send Transfer", self._go, color=ACCENT2, width=20).pack(anchor="w", ipady=4)
 
     def _go(self):
         try: amt = float(self.amt.get())
         except ValueError: messagebox.showerror("Error", "Enter a valid number."); return
-        self._result(*self.bank.transfer(self.to.get().strip(), amt))
+        self._result(*self.bank.transfer(self.to.get().strip(), amt, self.desc.get().strip()))
+
+
+# ── Income Page ───────────────────────────────────────────────────────────────
+class IncomePage(tk.Frame):
+    def __init__(self, parent, bank: Bank, app: BankingApp):
+        super().__init__(parent, bg=BG)
+        self.bank = bank
+        self.app  = app
+        self.pack(fill="both", expand=True, padx=32, pady=28)
+        self._build()
+
+    def _build(self):
+        label(self, "Income", font=("Segoe UI", 18, "bold"), bg=BG).pack(anchor="w")
+        label(self, "Your monthly income and pending requests", font=FONT_SM, fg=SUBTEXT, bg=BG).pack(anchor="w", pady=(2, 24))
+
+        # current income card
+        acc = self.bank.acc
+        income = acc.get("income", 0.0)
+        info_card = make_frame(self, bg=CARD)
+        info_card.pack(fill="x", pady=(0, 20))
+        inf = make_frame(info_card, bg=CARD)
+        inf.pack(fill="x", padx=24, pady=18)
+        label(inf, "Current Monthly Income", font=FONT_MED, bg=CARD).pack(anchor="w")
+        label(inf, f"${income:,.2f} / month", font=("Segoe UI", 20, "bold"), fg=GREEN, bg=CARD).pack(anchor="w", pady=(6, 4))
+        last = acc.get("last_income_date")
+        label(inf, f"Last paid: {last if last else 'Never'}", font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w")
+
+        # request card
+        req_card = make_frame(self, bg=CARD)
+        req_card.pack(fill="x", pady=(0, 20))
+        rq = make_frame(req_card, bg=CARD)
+        rq.pack(fill="x", padx=24, pady=18)
+        label(rq, "Request Income Change", font=FONT_MED, bg=CARD).pack(anchor="w")
+        label(rq, "Submit a request to the admin to update your monthly income.",
+              font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w", pady=(2, 14))
+
+        label(rq, "Requested Amount ($)", font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w")
+        self.req_amt = entry(rq, width=34)
+        self.req_amt.pack(anchor="w", ipady=8, pady=(2, 12))
+
+        label(rq, "Income Source / Description", font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w")
+        self.req_desc = entry(rq, width=34)
+        self.req_desc.pack(anchor="w", ipady=8, pady=(2, 16))
+
+        btn(rq, "Submit Request", self._submit_request, color=ACCENT, width=20).pack(anchor="w", ipady=4)
+
+        # pending requests
+        label(self, "Your Pending Requests", font=FONT_MED, bg=BG).pack(anchor="w", pady=(0, 10))
+        pending = list(requests_col.find({"username": self.bank.current, "status": "pending"}))
+        if not pending:
+            label(self, "No pending requests.", font=FONT_SM, fg=SUBTEXT, bg=BG).pack(anchor="w")
+        for req in pending:
+            row = make_frame(self, bg=CARD)
+            row.pack(fill="x", pady=2)
+            ri = make_frame(row, bg=CARD)
+            ri.pack(fill="x", padx=16, pady=10)
+            label(ri, req.get("description", ""), font=("Segoe UI", 9, "bold"), bg=CARD).pack(side="left")
+            label(ri, f"${req.get('amount', 0):,.2f}/mo", font=FONT_SM, fg=GREEN, bg=CARD).pack(side="left", padx=12)
+            label(ri, "⏳ Pending", font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(side="right")
+
+    def _submit_request(self):
+        try:
+            amt = float(self.req_amt.get())
+        except ValueError:
+            messagebox.showerror("Error", "Enter a valid amount.")
+            return
+        if amt < 0:
+            messagebox.showerror("Error", "Amount cannot be negative.")
+            return
+        desc = self.req_desc.get().strip()
+        if not desc:
+            messagebox.showerror("Error", "Description is required.")
+            return
+        requests_col.insert_one({
+            "username": self.bank.current,
+            "amount": amt,
+            "description": desc,
+            "status": "pending",
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        })
+        messagebox.showinfo("✓ Submitted", "Your income request has been sent to the admin.")
+        self.req_amt.delete(0, "end")
+        self.req_desc.delete(0, "end")
+        self.app._show_income()
 
 
 class HistoryPage(tk.Frame):
@@ -582,7 +678,6 @@ class HistoryPage(tk.Frame):
         label(self, "Transaction History", font=("Segoe UI", 18, "bold"), bg=BG).pack(anchor="w")
         label(self, "All your account activity", font=FONT_SM, fg=SUBTEXT, bg=BG).pack(anchor="w", pady=(2, 20))
 
-        # scrollable list
         canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
         scroll_frame = make_frame(canvas, bg=BG)
@@ -595,7 +690,6 @@ class HistoryPage(tk.Frame):
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Style scrollbar
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Vertical.TScrollbar", background=CARD2, troughcolor=BG,
@@ -606,10 +700,9 @@ class HistoryPage(tk.Frame):
             label(scroll_frame, "No transactions yet.", font=FONT_SM, fg=SUBTEXT, bg=BG).pack(anchor="w")
             return
 
-        # header
         hdr = make_frame(scroll_frame, bg=BG)
         hdr.pack(fill="x", pady=(0, 6))
-        for col, w in [("Date", 12), ("Description", 28), ("Type", 10), ("Amount", 12)]:
+        for col, w in [("Date", 12), ("Description", 36), ("Type", 10), ("Amount", 12)]:
             label(hdr, col, font=("Segoe UI", 9, "bold"), fg=SUBTEXT, bg=BG, width=w,
                   anchor="w").pack(side="left")
 
@@ -622,7 +715,7 @@ class HistoryPage(tk.Frame):
             sign  = "+" if tx["type"] == "credit" else ""
             for val, w, fg in [
                 (tx["date"],  12, SUBTEXT),
-                (tx["desc"],  28, TEXT),
+                (tx["desc"],  36, TEXT),
                 (tx["type"].capitalize(), 10, color),
             ]:
                 label(inner, val, font=FONT_SM, fg=fg, bg=CARD, width=w, anchor="w").pack(side="left")
@@ -630,10 +723,10 @@ class HistoryPage(tk.Frame):
                   font=("Segoe UI", 9, "bold"), fg=color, bg=CARD,
                   width=12, anchor="e").pack(side="right")
 
-        # mousewheel
         canvas.bind_all("<MouseWheel>",
             lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
-            
+
+
 class OptionsPage(tk.Frame):
     def __init__(self, parent, bank: Bank, app: BankingApp):
         super().__init__(parent, bg=BG)
@@ -667,7 +760,6 @@ class OptionsPage(tk.Frame):
         card1.pack(fill="x", padx=32, pady=(0, 12))
         inner1 = make_frame(card1, bg=CARD)
         inner1.pack(fill="x", padx=24, pady=22)
-
         label(inner1, "Display Name", font=FONT_MED, bg=CARD).pack(anchor="w")
         label(inner1, "Update the name shown on your account and sidebar.",
               font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w", pady=(2, 14))
@@ -686,7 +778,6 @@ class OptionsPage(tk.Frame):
         card2.pack(fill="x", padx=32, pady=(0, 12))
         inner2 = make_frame(card2, bg=CARD)
         inner2.pack(fill="x", padx=24, pady=22)
-
         label(inner2, "Username", font=FONT_MED, bg=CARD).pack(anchor="w")
         label(inner2, "Change your login username.",
               font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w", pady=(2, 14))
@@ -705,7 +796,6 @@ class OptionsPage(tk.Frame):
         card3.pack(fill="x", padx=32, pady=(0, 12))
         inner3 = make_frame(card3, bg=CARD)
         inner3.pack(fill="x", padx=24, pady=22)
-
         label(inner3, "Password", font=FONT_MED, bg=CARD).pack(anchor="w")
         label(inner3, "Choose a new password (min. 6 characters).",
               font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w", pady=(2, 14))
@@ -716,18 +806,16 @@ class OptionsPage(tk.Frame):
         self.new_pwd_e = entry(inner3, show="●", width=34)
         self.new_pwd_e.pack(anchor="w", ipady=8, pady=(2, 16))
         btn(inner3, "Save Password", self._save_password, color=ACCENT, width=18).pack(anchor="w", ipady=4)
-        
+
         # ── Theme ──
         card4 = make_frame(f, bg=CARD)
         card4.pack(fill="x", padx=32, pady=(0, 12))
         inner4 = make_frame(card4, bg=CARD)
         inner4.pack(fill="x", padx=24, pady=22)
-
         label(inner4, "Theme", font=FONT_MED, bg=CARD).pack(anchor="w")
         label(inner4, "Switch between dark and light mode.",
               font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w", pady=(2, 14))
-        cur_mode = THEME["mode"]
-        other_mode = "light" if cur_mode == "dark" else "dark"
+        other_mode = "light" if THEME["mode"] == "dark" else "dark"
         btn(inner4, f"Switch to {other_mode.capitalize()} Mode",
             self._toggle_theme, color=ACCENT2, width=24).pack(anchor="w", ipady=4)
 
@@ -736,7 +824,6 @@ class OptionsPage(tk.Frame):
         card5.pack(fill="x", padx=32, pady=(0, 32))
         inner5 = make_frame(card5, bg=CARD)
         inner5.pack(fill="x", padx=24, pady=22)
-
         label(inner5, "Delete Account", font=FONT_MED, bg=CARD).pack(anchor="w")
         label(inner5, "Permanently delete your account. This cannot be undone.",
               font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w", pady=(2, 14))
@@ -748,18 +835,17 @@ class OptionsPage(tk.Frame):
         self.app._show_dashboard()
 
     def _delete_account(self):
-        confirm = messagebox.askyesno(
-            "Delete Account",
-            f"Are you sure you want to delete the account '{self.bank.current}'?\nThis cannot be undone."
-        )
-        if not confirm:
+        if not messagebox.askyesno("Delete Account",
+                f"Are you sure you want to delete '{self.bank.current}'?\nThis cannot be undone."):
             return
         username = self.bank.current
         self.bank.logout()
         del self.bank.accounts[username]
         users_col.delete_one({"username": username})
+        requests_col.delete_many({"username": username})
         messagebox.showinfo("Deleted", "Your account has been deleted.")
         self.app._show_login()
+
     def _save_name(self):
         new_name = self.name_e.get().strip()
         if not new_name:
@@ -787,6 +873,7 @@ class OptionsPage(tk.Frame):
         self.bank.accounts[new_usr] = self.bank.accounts.pop(old)
         self.bank.current = new_usr
         users_col.update_one({"username": old}, {"$set": {"username": new_usr}})
+        requests_col.update_many({"username": old}, {"$set": {"username": new_usr}})
         self.current_usr_lbl.configure(text=new_usr)
         messagebox.showinfo("✓ Saved", f"Username changed to \"{new_usr}\".")
 
@@ -804,7 +891,9 @@ class OptionsPage(tk.Frame):
         self.cur_pwd_e.delete(0, "end")
         self.new_pwd_e.delete(0, "end")
         messagebox.showinfo("✓ Saved", "Password updated successfully.")
-        
+
+
+# ── Admin Page ────────────────────────────────────────────────────────────────
 class AdminPage(tk.Frame):
     def __init__(self, app: BankingApp):
         super().__init__(app, bg=BG)
@@ -813,24 +902,47 @@ class AdminPage(tk.Frame):
         self._build()
 
     def _build(self):
-        # ── top bar ──
         topbar = make_frame(self, bg="#0A0C12")
         topbar.pack(fill="x")
         inner_top = make_frame(topbar, bg="#0A0C12")
         inner_top.pack(fill="x", padx=24, pady=14)
         tk.Label(inner_top, text="◈  NeoBank Admin", font=("Segoe UI", 14, "bold"),
                  fg=ACCENT, bg="#0A0C12").pack(side="left")
+
+        # tab buttons
+        self.tab_var = tk.StringVar(value="accounts")
+        tab_frame = make_frame(inner_top, bg="#0A0C12")
+        tab_frame.pack(side="left", padx=24)
+        for label_text, val in [("Accounts", "accounts"), ("Income Requests", "requests")]:
+            tb = tk.Button(tab_frame, text=label_text,
+                           command=lambda v=val: self._switch_tab(v),
+                           bg="#0A0C12", fg=SUBTEXT, font=("Segoe UI", 9),
+                           relief="flat", padx=12, pady=4,
+                           activebackground=CARD, activeforeground=TEXT,
+                           cursor="hand2", bd=0)
+            tb.pack(side="left", padx=4)
+
         btn(inner_top, "⏻  Exit Admin", self._exit,
             color="#1C2333", fg=RED, width=14).pack(side="right")
 
         sep(self, bg=BORDER).pack(fill="x")
 
-        # ── main area ──
-        main = make_frame(self, bg=BG)
-        main.pack(fill="both", expand=True)
+        self.main = make_frame(self, bg=BG)
+        self.main.pack(fill="both", expand=True)
 
-        # left: user list
-        left = make_frame(main, bg=CARD, width=220)
+        self._show_accounts_tab()
+
+    def _switch_tab(self, tab):
+        for w in self.main.winfo_children():
+            w.destroy()
+        if tab == "accounts":
+            self._show_accounts_tab()
+        else:
+            self._show_requests_tab()
+
+    # ── Accounts tab ──
+    def _show_accounts_tab(self):
+        left = make_frame(self.main, bg=CARD, width=220)
         left.pack(side="left", fill="y")
         left.pack_propagate(False)
 
@@ -843,8 +955,7 @@ class AdminPage(tk.Frame):
         btn(left, "+ New Account", self._new_account_dialog,
             color=GREEN, fg="#0D0F14", width=18).pack(fill="x", padx=12, pady=12)
 
-        # right: editor
-        self.right = make_frame(main, bg=BG)
+        self.right = make_frame(self.main, bg=BG)
         self.right.pack(side="left", fill="both", expand=True)
 
         self._refresh_user_list()
@@ -874,7 +985,6 @@ class AdminPage(tk.Frame):
 
         acc = self.app.bank.accounts[username]
 
-        # header
         hdr = make_frame(self.right, bg=BG)
         hdr.pack(fill="x", padx=32, pady=(24, 0))
         label(hdr, f"Editing: {username}", font=("Segoe UI", 16, "bold"), bg=BG).pack(side="left", anchor="w")
@@ -883,7 +993,6 @@ class AdminPage(tk.Frame):
 
         sep(self.right, bg=BORDER).pack(fill="x", padx=32, pady=12)
 
-        # scrollable content
         canvas = tk.Canvas(self.right, bg=BG, highlightthickness=0)
         scrollbar = ttk.Scrollbar(self.right, orient="vertical", command=canvas.yview)
         sf = make_frame(canvas, bg=BG)
@@ -904,31 +1013,28 @@ class AdminPage(tk.Frame):
 
         f = sf
 
-        # ── Name ──
+        # Name
         card1 = make_frame(f, bg=CARD)
         card1.pack(fill="x", padx=32, pady=(0, 12))
         i1 = make_frame(card1, bg=CARD)
         i1.pack(fill="x", padx=24, pady=18)
         label(i1, "Display Name", font=FONT_MED, bg=CARD).pack(anchor="w")
         name_e = field(i1, "Name", acc["name"])
-
         def save_name():
             v = name_e.get().strip()
             if not v: messagebox.showerror("Error", "Name cannot be empty."); return
             self.app.bank.accounts[username]["name"] = v
             users_col.update_one({"username": username}, {"$set": {"name": v}})
             messagebox.showinfo("✓ Saved", "Name updated.")
-
         btn(i1, "Save Name", save_name, color=ACCENT, width=16).pack(anchor="w", ipady=4)
 
-        # ── Username ──
+        # Username
         card2 = make_frame(f, bg=CARD)
         card2.pack(fill="x", padx=32, pady=(0, 12))
         i2 = make_frame(card2, bg=CARD)
         i2.pack(fill="x", padx=24, pady=18)
         label(i2, "Username", font=FONT_MED, bg=CARD).pack(anchor="w")
         usr_e = field(i2, "Username", username)
-
         def save_username():
             new = usr_e.get().strip()
             if not new: messagebox.showerror("Error", "Username cannot be empty."); return
@@ -938,17 +1044,15 @@ class AdminPage(tk.Frame):
             users_col.update_one({"username": username}, {"$set": {"username": new}})
             messagebox.showinfo("✓ Saved", f"Username changed to \"{new}\".")
             self._refresh_user_list(select=new)
-
         btn(i2, "Save Username", save_username, color=ACCENT, width=16).pack(anchor="w", ipady=4)
 
-        # ── Password ──
+        # Password
         card3 = make_frame(f, bg=CARD)
         card3.pack(fill="x", padx=32, pady=(0, 12))
         i3 = make_frame(card3, bg=CARD)
         i3.pack(fill="x", padx=24, pady=18)
         label(i3, "Password", font=FONT_MED, bg=CARD).pack(anchor="w")
         pwd_e = field(i3, "New password", "", show="●")
-
         def save_password():
             new = pwd_e.get()
             if len(new) < 6: messagebox.showerror("Error", "Min. 6 characters."); return
@@ -956,27 +1060,42 @@ class AdminPage(tk.Frame):
             users_col.update_one({"username": username}, {"$set": {"password": new}})
             pwd_e.delete(0, "end")
             messagebox.showinfo("✓ Saved", "Password updated.")
-
         btn(i3, "Save Password", save_password, color=ACCENT, width=16).pack(anchor="w", ipady=4)
 
-        # ── Balance ──
+        # Balance
         card4 = make_frame(f, bg=CARD)
         card4.pack(fill="x", padx=32, pady=(0, 12))
         i4 = make_frame(card4, bg=CARD)
         i4.pack(fill="x", padx=24, pady=18)
         label(i4, "Balance", font=FONT_MED, bg=CARD).pack(anchor="w")
         bal_e = field(i4, "Balance ($)", str(acc["balance"]))
-
         def save_balance():
             try: v = float(bal_e.get())
             except ValueError: messagebox.showerror("Error", "Enter a valid number."); return
             self.app.bank.accounts[username]["balance"] = v
             users_col.update_one({"username": username}, {"$set": {"balance": v}})
             messagebox.showinfo("✓ Saved", f"Balance set to ${v:,.2f}.")
-
         btn(i4, "Save Balance", save_balance, color=ACCENT, width=16).pack(anchor="w", ipady=4)
 
-        # ── Transactions ──
+        # Income
+        card4b = make_frame(f, bg=CARD)
+        card4b.pack(fill="x", padx=32, pady=(0, 12))
+        i4b = make_frame(card4b, bg=CARD)
+        i4b.pack(fill="x", padx=24, pady=18)
+        label(i4b, "Monthly Income", font=FONT_MED, bg=CARD).pack(anchor="w")
+        label(i4b, "Amount automatically added at the start of each month.",
+              font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w", pady=(2, 14))
+        inc_e = field(i4b, "Monthly Income ($)", str(acc.get("income", 0.0)))
+        def save_income():
+            try: v = float(inc_e.get())
+            except ValueError: messagebox.showerror("Error", "Enter a valid number."); return
+            if v < 0: messagebox.showerror("Error", "Income cannot be negative."); return
+            self.app.bank.accounts[username]["income"] = v
+            users_col.update_one({"username": username}, {"$set": {"income": v}})
+            messagebox.showinfo("✓ Saved", f"Monthly income set to ${v:,.2f}.")
+        btn(i4b, "Save Income", save_income, color=ACCENT, width=16).pack(anchor="w", ipady=4)
+
+        # Transactions
         card5 = make_frame(f, bg=CARD)
         card5.pack(fill="x", padx=32, pady=(0, 32))
         i5 = make_frame(card5, bg=CARD)
@@ -984,14 +1103,12 @@ class AdminPage(tk.Frame):
         label(i5, "Transactions", font=FONT_MED, bg=CARD).pack(anchor="w")
         label(i5, f"{len(acc['transactions'])} transaction(s) on record.",
               font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(anchor="w", pady=(4, 12))
-
         def clear_transactions():
             if not messagebox.askyesno("Confirm", "Clear all transactions for this user?"): return
             self.app.bank.accounts[username]["transactions"] = []
             users_col.update_one({"username": username}, {"$set": {"transactions": []}})
             messagebox.showinfo("✓ Done", "Transactions cleared.")
             self._select_user(username)
-
         btn(i5, "Clear Transactions", clear_transactions, color=RED, width=20).pack(anchor="w", ipady=4)
 
     def _delete_user(self, username):
@@ -999,6 +1116,7 @@ class AdminPage(tk.Frame):
             return
         del self.app.bank.accounts[username]
         users_col.delete_one({"username": username})
+        requests_col.delete_many({"username": username})
         for w in self.right.winfo_children():
             w.destroy()
         label(self.right, "Select an account from the left.",
@@ -1046,9 +1164,77 @@ class AdminPage(tk.Frame):
 
         btn(f, "Create Account", create, color=GREEN, fg="#0D0F14", width=24).pack(fill="x", ipady=4, pady=(8, 0))
 
+    # ── Requests tab ──
+    def _show_requests_tab(self):
+        wrapper = make_frame(self.main, bg=BG)
+        wrapper.pack(fill="both", expand=True)
+
+        label(wrapper, "Income Requests", font=("Segoe UI", 16, "bold"), bg=BG).pack(anchor="w", padx=32, pady=(24, 4))
+        label(wrapper, "Review and approve or reject user income change requests.",
+              font=FONT_SM, fg=SUBTEXT, bg=BG).pack(anchor="w", padx=32, pady=(0, 16))
+
+        canvas = tk.Canvas(wrapper, bg=BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(wrapper, orient="vertical", command=canvas.yview)
+        sf = make_frame(canvas, bg=BG)
+        sf.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=sf, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        canvas.bind_all("<MouseWheel>",
+            lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+
+        pending = list(requests_col.find({"status": "pending"}))
+        if not pending:
+            label(sf, "No pending requests.", font=FONT_SM, fg=SUBTEXT, bg=BG).pack(anchor="w", padx=32, pady=16)
+            return
+
+        for req in pending:
+            card = make_frame(sf, bg=CARD)
+            card.pack(fill="x", padx=32, pady=(0, 10))
+            inner = make_frame(card, bg=CARD)
+            inner.pack(fill="x", padx=24, pady=16)
+
+            top_row = make_frame(inner, bg=CARD)
+            top_row.pack(fill="x")
+            label(top_row, req["username"], font=("Segoe UI", 10, "bold"), bg=CARD, fg=ACCENT).pack(side="left")
+            label(top_row, req.get("date", ""), font=FONT_SM, fg=SUBTEXT, bg=CARD).pack(side="right")
+
+            label(inner, f"Requested income: ${req.get('amount', 0):,.2f} / month",
+                  font=("Segoe UI", 10, "bold"), fg=GREEN, bg=CARD).pack(anchor="w", pady=(6, 2))
+            label(inner, f"Source: {req.get('description', '')}",
+                  font=FONT_SM, fg=TEXT, bg=CARD).pack(anchor="w", pady=(0, 12))
+
+            btn_row = make_frame(inner, bg=CARD)
+            btn_row.pack(anchor="w")
+
+            rid = req["_id"]
+            uname = req["username"]
+            amt = req.get("amount", 0)
+
+            def approve(r=rid, u=uname, a=amt):
+                if u not in self.app.bank.accounts:
+                    messagebox.showerror("Error", "User no longer exists.")
+                    requests_col.update_one({"_id": r}, {"$set": {"status": "rejected"}})
+                    self._switch_tab("requests")
+                    return
+                self.app.bank.accounts[u]["income"] = a
+                users_col.update_one({"username": u}, {"$set": {"income": a}})
+                requests_col.update_one({"_id": r}, {"$set": {"status": "approved"}})
+                messagebox.showinfo("✓ Approved", f"Income for {u} set to ${a:,.2f}/mo.")
+                self._switch_tab("requests")
+
+            def reject(r=rid):
+                requests_col.update_one({"_id": r}, {"$set": {"status": "rejected"}})
+                self._switch_tab("requests")
+
+            btn(btn_row, "✓ Approve", approve, color=GREEN, fg="#0D0F14", width=12).pack(side="left", ipady=4)
+            btn(btn_row, "✗ Reject", reject, color=RED, width=12).pack(side="left", padx=(8, 0), ipady=4)
+
     def _exit(self):
         self.app._show_login()
-            
+
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = BankingApp()
